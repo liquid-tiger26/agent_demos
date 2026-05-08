@@ -1,0 +1,50 @@
+name: Prowler AWS Security Scan - Soft Fail
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prowler-scan:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Install Prowler
+        run: pip install prowler
+
+      - name: Run Prowler scan
+        id: prowler
+        continue-on-error: true
+        run: |
+          prowler aws --checks ec2_instance_public_ip s3_bucket_public_access -M csv html
+
+          
+      - name: Debug results
+        if: always()
+        run: |
+          echo "Files in output/:"
+          ls -la output/ || echo "No output directory"
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: prowler-results
+          path: output/
+          retention-days: 14
