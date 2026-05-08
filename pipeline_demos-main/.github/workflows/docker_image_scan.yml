@@ -1,0 +1,42 @@
+name: Docker Image Security Scan - Soft Fail True
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  grype-image-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Build Docker image
+        run: docker build -t myapp:${{ github.sha }} .
+
+      - name: Scan image with Grype
+        id: grype
+        uses: anchore/scan-action@v7
+        with:
+          image: myapp:${{ github.sha }}
+          fail-build: false
+          severity-cutoff: high
+          output-format: json
+          output-file: grype-results.json
+
+      - name: Upload Grype JSON
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: grype-results
+          path: grype-results.json
+          retention-days: 14
