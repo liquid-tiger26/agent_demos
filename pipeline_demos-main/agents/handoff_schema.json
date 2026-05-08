@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PapayaKiwiHandoff",
+  "description": "Validated JSON contract passed from Papaya (advisory agent) to Kiwi (executor agent).",
+  "type": "object",
+  "required": ["schema_version", "request_id", "natural_language_prompt", "intent", "scan_targets", "severity_threshold", "remediation"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "request_id": {
+      "type": "string",
+      "description": "UUID v4 uniquely identifying this advisory request."
+    },
+    "natural_language_prompt": {
+      "type": "string",
+      "description": "The original user prompt passed to Papaya, verbatim."
+    },
+    "intent": {
+      "type": "string",
+      "enum": ["scan_and_remediate", "scan_only", "remediate_only"],
+      "description": "High-level action Kiwi should take."
+    },
+    "scan_targets": {
+      "type": "object",
+      "description": "Which scan pipelines Kiwi should activate.",
+      "required": ["container", "iac", "cloud"],
+      "additionalProperties": false,
+      "properties": {
+        "container": {
+          "type": "boolean",
+          "description": "Run Grype container image scan."
+        },
+        "iac": {
+          "type": "boolean",
+          "description": "Run Checkov Terraform IaC scan."
+        },
+        "cloud": {
+          "type": "boolean",
+          "description": "Run Prowler live AWS cloud scan."
+        }
+      }
+    },
+    "severity_threshold": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low"],
+      "description": "Minimum severity level Kiwi should act on."
+    },
+    "remediation": {
+      "type": "object",
+      "required": ["enabled", "strategy", "branch_prefix"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether Kiwi should attempt to remediate findings."
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["open_pr", "direct_push", "report_only"],
+          "description": "How Kiwi should surface remediations."
+        },
+        "branch_prefix": {
+          "type": "string",
+          "description": "Git branch name prefix for remediation commits.",
+          "default": "kiwi/remediation"
+        }
+      }
+    }
+  }
+}

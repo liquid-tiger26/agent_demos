@@ -1,0 +1,190 @@
+PAPAYA & KIWI DUAL-AGENT DEMO — STEP BY STEP TESTING GUIDE
+===========================================================
+
+PREREQUISITES
+-------------
+1. This repo pushed to GitHub (not just local).
+2. GitHub account with GitHub Models access enabled.
+   - Go to https://github.com/marketplace/models and sign in to confirm access.
+3. Actions enabled on the repository.
+   - Repo → Settings → Actions → General → "Allow all actions and reusable workflows"
+4. PR creation permission enabled.
+   - Repo → Settings → Actions → General → scroll to "Workflow permissions"
+   - Select "Read and write permissions"
+   - Check "Allow GitHub Actions to create and approve pull requests"
+   - Save.
+
+OPTIONAL (for Prowler cloud scan job)
+- Add secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+- Add variable: AWS_REGION (e.g. us-east-1)
+- Repo → Settings → Secrets and variables → Actions
+- If you skip this, the scan-cloud job will be skipped automatically when
+  the handoff schema has scan_targets.cloud = false. No errors.
+
+
+STEP 1 — PUSH THE REPO TO GITHUB
+---------------------------------
+If you haven't already:
+
+  cd /Users/saracosta/Desktop/pipeline_demos
+  git init
+  git add .
+  git commit -m "feat: add Papaya and Kiwi dual-agent pipeline"
+  git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+  git push -u origin main
+
+Replace YOUR_USERNAME and YOUR_REPO with your actual GitHub username and repo name.
+
+
+STEP 2 — VERIFY WORKFLOWS ARE VISIBLE
+--------------------------------------
+Go to: https://github.com/YOUR_USERNAME/YOUR_REPO/actions
+
+You should see these workflows listed on the left:
+  - Papaya - Advisory Agent
+  - Kiwi - Executor Agent
+  - Checkov Scan
+  - Docker Image Security Scan - Soft Fail True
+  - Prowler AWS Security Scan - Soft Fail
+  - TruffleHog Secret Scan - Soft Fail
+
+If they don't appear, make sure the .github/workflows/ files were pushed.
+
+
+STEP 3 — RUN TEST 1: IaC-only scan (fastest, no Docker build, no AWS)
+-----------------------------------------------------------------------
+This is the best first test. Checkov will find real failures in tf/ immediately.
+
+  a. Go to Actions → "Papaya - Advisory Agent" → "Run workflow" (top right)
+  b. In the prompt field enter exactly:
+       scan my terraform infrastructure and fix any high severity misconfigurations
+  c. Click "Run workflow"
+  d. Click into the running workflow to watch it.
+
+What to look for in Papaya logs:
+  - Step "Call GitHub Models" — should complete in ~5-10 seconds
+  - Step "Validate handoff against schema" — should print "Schema validation passed."
+  - Step "Print PAPAYA OUTPUT" — look for the labeled block showing JSON like:
+      {
+        "intent": "scan_and_remediate",
+        "scan_targets": { "container": false, "iac": true, "cloud": false },
+        "severity_threshold": "high",
+        ...
+      }
+  - Step "Trigger Kiwi via repository_dispatch" — should print "Kiwi triggered. HTTP 204"
+  - Check the workflow Summary tab for a formatted view of the handoff JSON.
+
+Expected Papaya duration: ~30-60 seconds total.
+
+
+STEP 4 — WATCH KIWI FIRE AUTOMATICALLY
+----------------------------------------
+  a. Go back to the Actions tab: https://github.com/YOUR_USERNAME/YOUR_REPO/actions
+  b. You should see a NEW workflow run appear — "Kiwi - Executor Agent" — without
+     you doing anything. This is the repository_dispatch trigger.
+  c. Click into the Kiwi run.
+
+What to look for in Kiwi logs:
+  - Job "Parse Handoff Schema":
+      - Prints "KIWI INPUT" with the received JSON
+      - Prints "Handoff validation passed."
+  - Job "Scan IaC (Checkov)" fires (scan_iac = true)
+  - Jobs "Scan Container" and "Scan Cloud" show as skipped (expected)
+  - Job "Kiwi Remediation + Open PR":
+      - "List downloaded artifacts" shows checkov-results.json was downloaded
+      - "Run Kiwi remediation script" calls GitHub Models and prints "[kiwi] Patched: tf/s3.tf" etc.
+      - "Check if any tf/ files changed" → changed=true
+      - "Create remediation branch and commit" → pushes kiwi/remediation-{run_id}
+      - "Open Pull Request" → opens PR
+
+
+STEP 5 — REVIEW THE REMEDIATION PR
+------------------------------------
+  a. Go to: https://github.com/YOUR_USERNAME/YOUR_REPO/pulls
+  b. You should see a PR titled something like:
+       "fix: remediate high-severity IaC misconfigurations"
+     opened by github-actions bot, from branch kiwi/remediation-{run_id}
+  c. Open the PR. The body should contain:
+     - A findings table with Check IDs, resources, severities, and fix status
+     - Description of each patch applied
+  d. Click "Files changed" to see the actual diffs to tf/s3.tf, tf/ec2_instance.tf, etc.
+
+Expected fixes you should see:
+  - tf/s3.tf: versioning block added, server_side_encryption_configuration added
+  - tf/ec2_instance.tf: metadata_options with http_tokens = "required" added
+  - tf/google_compute_instance.tf: shielded_instance_config block added
+
+
+STEP 6 — RUN TEST 2: Container scan (takes longer — Docker build required)
+---------------------------------------------------------------------------
+  a. Actions → "Papaya - Advisory Agent" → "Run workflow"
+  b. Prompt:
+       scan this container image and remediate any critical CVEs
+  c. Watch Papaya — handoff should have scan_targets.container = true, iac = false
+  d. Watch Kiwi — "Scan Container (Grype)" job will build the Docker image and run Grype
+  e. Note: container CVEs can't be fixed in Terraform, so Kiwi's PR body will document
+     recommended base image upgrades but may not patch any tf/ files.
+     Exit code 2 from remediate.py ("nothing to patch") is expected and handled.
+
+Expected Kiwi scan-container duration: ~3-5 minutes (Docker build + Grype scan).
+
+
+STEP 7 — RUN TEST 3: Full scan (everything)
+---------------------------------------------
+Only do this if AWS credentials are configured (Step PREREQUISITES above).
+
+  a. Actions → "Papaya - Advisory Agent" → "Run workflow"
+  b. Prompt:
+       scan everything — container, infrastructure, and live AWS — and fix all high severity findings
+  c. Watch Papaya — handoff should have all three scan_targets = true
+  d. Watch Kiwi — all three scan jobs fire in parallel
+  e. Remediation PR should contain findings from all three sources
+
+
+TROUBLESHOOTING
+---------------
+
+Problem: Papaya fails at "Call GitHub Models" with HTTP 401 or 403
+Fix: GitHub Models access may not be enabled on your account.
+     Go to https://github.com/marketplace/models, sign in, and accept terms.
+     The GITHUB_TOKEN used in Actions must have models:read scope — this is automatic
+     for repos where you have GitHub Models enabled.
+
+Problem: Kiwi workflow doesn't appear after Papaya completes
+Fix: The repository_dispatch requires "actions: write" permission.
+     Check that Workflow permissions are set to "Read and write" in repo settings.
+     Also confirm the Kiwi workflow file is on the default branch (main).
+
+Problem: Kiwi "Open Pull Request" step fails with 403
+Fix: Ensure "Allow GitHub Actions to create and approve pull requests" is checked
+     in Repo → Settings → Actions → General → Workflow permissions.
+
+Problem: Checkov finds no failures
+Fix: Make sure the checkov-results.json artifact was uploaded. The Checkov job uses
+     soft_fail: true so it won't block, but it should still write results.
+     Check the "Run Checkov on Terraform" step logs for the summary output.
+
+Problem: remediate.py exits with code 2 ("no findings at threshold")
+Fix: This is expected when Grype finds no CVEs at the severity threshold.
+     Try a lower threshold prompt: "scan and fix all medium and above findings"
+     The Kiwi workflow handles exit code 2 gracefully — it checks git diff
+     directly and only creates a PR if tf/ files actually changed.
+
+Problem: "kiwi/remediation-*" branch already exists on re-run
+Fix: The branch name includes the run_id so each run gets a unique branch.
+     If you re-run the same workflow job (not a new run), delete the branch first:
+       git push origin --delete kiwi/remediation-{old_run_id}
+
+
+DEMO SCRIPT (for presenting live)
+-----------------------------------
+1. Show the repo structure briefly — tf/ files, agents/ folder, two workflows.
+2. Open tf/s3.tf — point out there's no encryption or versioning (intentional).
+3. Go to Actions → Papaya → Run workflow.
+4. Type the prompt live: "scan my terraform infrastructure and fix any high severity misconfigurations"
+5. While Papaya runs, explain what it's doing: calling GPT-4o to translate the prompt.
+6. Show the PAPAYA OUTPUT section in logs — highlight the structured JSON.
+7. Switch to the Actions tab — point to the Kiwi run appearing automatically.
+8. Let Kiwi run (IaC-only is ~2 min total). Narrate the scan job and remediation job.
+9. Go to Pull Requests — show the opened PR with the findings table and code diff.
+10. Done. Natural language → validated schema → automated scans → remediation PR.
