@@ -1,0 +1,122 @@
+name: "Papaya - Advisory Agent"
+# Translates a plain-language security prompt into a validated JSON handoff
+# schema, then fires the Kiwi executor via repository_dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Natural language security request (e.g. 'scan this container image and remediate any critical CVEs')"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write  # required to fire repository_dispatch
+  models: read    # required for GitHub Models API
+
+jobs:
+  papaya:
+    name: "Papaya Advisory"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install jsonschema
+
+      # Call GitHub Models -> write papaya-handoff.json
+      # Falls back to a deterministic keyword parser if the API is unavailable.
+      - name: Generate handoff schema
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USER_PROMPT: ${{ inputs.prompt }}
+        run: python3 agents/papaya_call.py
+
+      # Validate the output against the JSON Schema before passing it to Kiwi.
+      - name: Validate handoff schema
+        id: validate
+        run: |
+          python3 - <<'EOF'
+          import json, sys, pathlib, jsonschema
+          schema  = json.loads(pathlib.Path("agents/handoff_schema.json").read_text())
+          handoff = json.loads(pathlib.Path("papaya-handoff.json").read_text())
+          try:
+              jsonschema.validate(instance=handoff, schema=schema)
+          except jsonschema.ValidationError as e:
+              print(f"::error::Schema validation failed: {e.message}", file=sys.stderr)
+              sys.exit(1)
+          print("Schema validation passed.")
+          EOF
+
+      # Print the handoff so it's visible in the live demo logs.
+      - name: "PAPAYA OUTPUT"
+        run: |
+          echo "========================================================"
+          echo "  PAPAYA OUTPUT -- validated handoff schema"
+          echo "========================================================"
+          python3 -m json.tool papaya-handoff.json
+          echo "========================================================"
+
+      - name: Upload handoff artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: papaya-handoff
+          path: papaya-handoff.json
+          retention-days: 7
+
+      # Fire the Kiwi executor workflow. Shows as a separate run in Actions tab.
+      - name: Trigger Kiwi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, pathlib, urllib.request, urllib.error
+          repo    = os.environ["GITHUB_REPOSITORY"]
+          token   = os.environ["GITHUB_TOKEN"]
+          handoff = json.loads(pathlib.Path("papaya-handoff.json").read_text())
+          body = json.dumps({
+              "event_type": "kiwi-execute",
+              "client_payload": {
+                  "handoff": handoff,
+                  "papaya_run_id": os.environ["GITHUB_RUN_ID"]
+              }
+          }).encode()
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/dispatches",
+              data=body,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req) as r:
+                  print(f"Kiwi triggered -- HTTP {r.status}")
+          except urllib.error.HTTPError as e:
+              err = e.read().decode(errors="replace")
+              raise RuntimeError(f"Dispatch failed HTTP {e.code}: {err}. "
+                                 "Check Settings > Actions > Workflow permissions = Read and write.")
+          EOF
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Papaya Advisory Complete"
+            echo "**Prompt:** ${{ inputs.prompt }}"
+            echo ""
+            echo '```json'
+            python3 -m json.tool papaya-handoff.json
+            echo '```'
+            echo ""
+            echo "Kiwi triggered -- see the Kiwi - Executor Agent run in the Actions tab."
+          } >> "$GITHUB_STEP_SUMMARY"
