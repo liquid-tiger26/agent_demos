@@ -1,0 +1,285 @@
+name: "Kiwi - Executor Agent"
+# Receives a validated handoff JSON from Papaya, runs the requested security
+# scans (Grype / Checkov / Prowler / TruffleHog), then calls GitHub Models to draft
+# remediation patches and opens a pull request on tf/.
+
+on:
+  repository_dispatch:
+    types: [kiwi-execute]
+  workflow_dispatch:  # makes this workflow appear by name in the Actions sidebar
+
+permissions:
+  contents: write
+  pull-requests: write
+  models: read    # required for GitHub Models API
+
+# Pull fields out of the incoming handoff payload for use across all jobs.
+# Also opts into Node.js 24 to suppress Node 20 deprecation warnings on artifact actions.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  HANDOFF:   ${{ toJson(github.event.client_payload.handoff) }}
+  INTENT:    ${{ github.event.client_payload.handoff.intent }}
+  SEVERITY:  ${{ github.event.client_payload.handoff.severity_threshold }}
+  SCAN_CTR:  ${{ github.event.client_payload.handoff.scan_targets.container }}
+  SCAN_IAC:  ${{ github.event.client_payload.handoff.scan_targets.iac }}
+  SCAN_CLD:  ${{ github.event.client_payload.handoff.scan_targets.cloud }}
+  SCAN_SEC:  ${{ github.event.client_payload.handoff.scan_targets.secrets }}
+  REMEDIATE: ${{ github.event.client_payload.handoff.remediation.enabled }}
+
+jobs:
+  # ── Job 1: Parse & validate the incoming handoff ──────────────────────────
+  parse:
+    name: "Parse Handoff"
+    runs-on: ubuntu-latest
+    outputs:
+      scan_container: ${{ steps.parse.outputs.scan_container }}
+      scan_iac:       ${{ steps.parse.outputs.scan_iac }}
+      scan_cloud:     ${{ steps.parse.outputs.scan_cloud }}
+      scan_secrets:   ${{ steps.parse.outputs.scan_secrets }}
+      severity:       ${{ steps.parse.outputs.severity }}
+      remediation:    ${{ steps.parse.outputs.remediation }}
+      intent:         ${{ steps.parse.outputs.intent }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install jsonschema
+
+      - name: Validate & export handoff fields
+        id: parse
+        env:
+          HANDOFF: ${{ toJson(github.event.client_payload.handoff) }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys, pathlib, jsonschema
+
+          handoff = json.loads(os.environ["HANDOFF"])
+          schema  = json.loads(pathlib.Path("agents/handoff_schema.json").read_text())
+
+          try:
+              jsonschema.validate(instance=handoff, schema=schema)
+          except jsonschema.ValidationError as e:
+              print(f"::error::Handoff schema validation failed: {e.message}", file=sys.stderr)
+              sys.exit(1)
+
+          t = handoff["scan_targets"]
+          r = handoff["remediation"]
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          out.write_text(
+              f"scan_container={str(t['container']).lower()}\n"
+              f"scan_iac={str(t['iac']).lower()}\n"
+              f"scan_cloud={str(t['cloud']).lower()}\n"
+              f"scan_secrets={str(t['secrets']).lower()}\n"
+              f"severity={handoff['severity_threshold']}\n"
+              f"remediation={str(r['enabled']).lower()}\n"
+              f"intent={handoff['intent']}\n"
+          )
+          print("Handoff valid:", json.dumps(handoff, indent=2))
+          EOF
+
+  # ── Job 2: Container scan (Grype) ─────────────────────────────────────────
+  scan-container:
+    name: "Scan: Container (Grype)"
+    needs: parse
+    if: needs.parse.outputs.scan_container == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build image
+        run: docker build -t demo-image:latest .
+
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Grype scan
+        run: |
+          grype demo-image:latest -o json > grype-results.json || true
+          [ -s grype-results.json ] || echo '{"matches":[]}' > grype-results.json
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: grype-results
+          path: grype-results.json
+
+  # ── Job 3: IaC scan (Checkov) ─────────────────────────────────────────────
+  scan-iac:
+    name: "Scan: IaC (Checkov)"
+    needs: parse
+    if: needs.parse.outputs.scan_iac == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkov scan
+        run: |
+          pip install checkov --quiet
+          checkov -d tf/ --framework terraform -o json --soft-fail > checkov-results.json || true
+          [ -s checkov-results.json ] || echo '[]' > checkov-results.json
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: checkov-results
+          path: checkov-results.json
+
+  # ── Job 4: Cloud scan (Prowler) — requires AWS secrets ────────────────────
+  scan-cloud:
+    name: "Scan: Cloud (Prowler)"
+    needs: parse
+    if: needs.parse.outputs.scan_cloud == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            us-east-1
+
+      - name: Run Prowler
+        run: |
+          pip install prowler
+          prowler aws --output-formats json --output-directory output/ || true
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: prowler-results
+          path: output/
+
+  # ── Job 5: Secrets scan (TruffleHog) ─────────────────────────────────────
+  scan-secrets:
+    name: "Scan: Secrets (TruffleHog)"
+    needs: parse
+    if: needs.parse.outputs.scan_secrets == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            trufflesecurity/trufflehog:latest \
+            filesystem /repo \
+            --json > trufflehog-results.json || true
+          [ -s trufflehog-results.json ] || echo '[]' > trufflehog-results.json
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: trufflehog-results
+          path: trufflehog-results.json
+
+  # ── Job 6: LLM remediation + open PR ──────────────────────────────────────
+  remediate:
+    name: "Remediate & Open PR"
+    needs: [parse, scan-container, scan-iac, scan-cloud, scan-secrets]
+    # Run even when earlier scan jobs are skipped; check remediation flag.
+    if: |
+      always() &&
+      needs.parse.result == 'success' &&
+      needs.parse.outputs.remediation == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # Only download artifacts for scan jobs that actually ran.
+      - uses: actions/download-artifact@v5
+        if: needs.scan-container.result == 'success'
+        with:
+          name: grype-results
+          path: .
+
+      - uses: actions/download-artifact@v5
+        if: needs.scan-iac.result == 'success'
+        with:
+          name: checkov-results
+          path: .
+
+      - uses: actions/download-artifact@v5
+        if: needs.scan-cloud.result == 'success'
+        with:
+          name: prowler-results
+          path: output/
+
+      - uses: actions/download-artifact@v5
+        if: needs.scan-secrets.result == 'success'
+        with:
+          name: trufflehog-results
+          path: .
+
+      - name: Run remediation agent
+        id: remediate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEVERITY:     ${{ needs.parse.outputs.severity }}
+          INTENT:       ${{ needs.parse.outputs.intent }}
+        run: |
+          python3 agents/remediate.py
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Open remediation PR
+        if: steps.remediate.outcome == 'success'
+        env:
+          # PAT_TOKEN (repo scope) bypasses org-level PR creation restrictions.
+          # Falls back to GITHUB_TOKEN if PAT_TOKEN is not set.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if any tf/ files were actually changed.
+          git diff --quiet tf/ && { echo "No changes to commit."; exit 0; }
+
+          # Read PR title/body written by remediate.py (fallback to defaults).
+          TITLE=$(python3 -c "
+          import json, pathlib
+          d = json.loads(pathlib.Path('kiwi-output.json').read_text()) if pathlib.Path('kiwi-output.json').exists() else {}
+          print(d.get('pr_title', 'chore: Kiwi security remediation'))
+          " 2>/dev/null || echo "chore: Kiwi security remediation")
+
+          BODY=$(python3 -c "
+          import json, pathlib
+          d = json.loads(pathlib.Path('kiwi-output.json').read_text()) if pathlib.Path('kiwi-output.json').exists() else {}
+          print(d.get('pr_body', 'Automated remediation by Kiwi executor agent.'))
+          " 2>/dev/null || echo "Automated remediation by Kiwi executor agent.")
+
+          BRANCH="kiwi/remediation-${{ github.run_id }}"
+          git config user.email "kiwi-bot@github.com"
+          git config user.name  "Kiwi Bot"
+          git checkout -b "$BRANCH"
+          git add tf/
+          git commit -m "$TITLE"
+          git push origin "$BRANCH"
+          gh pr create --title "$TITLE" --body "$BODY" --head "$BRANCH" --base main || {
+            echo "::warning::PR creation blocked by repository/org Actions policy."
+            echo "Remediation branch pushed successfully: $BRANCH"
+            echo "Open a PR manually at: https://github.com/$GITHUB_REPOSITORY/compare/$BRANCH"
+            exit 0
+          }
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Kiwi Executor Complete"
+            echo "**Intent:** ${{ needs.parse.outputs.intent }}"
+            echo "**Severity threshold:** ${{ needs.parse.outputs.severity }}"
+            echo ""
+            echo "| Scan | Requested | Result |"
+            echo "|------|-----------|--------|"
+            echo "| Container | ${{ needs.parse.outputs.scan_container }} | ${{ needs.scan-container.result }} |"
+            echo "| IaC       | ${{ needs.parse.outputs.scan_iac }}       | ${{ needs.scan-iac.result }}       |"
+            echo "| Cloud     | ${{ needs.parse.outputs.scan_cloud }}     | ${{ needs.scan-cloud.result }}     |"
+            echo "| Secrets   | ${{ needs.parse.outputs.scan_secrets }}   | ${{ needs.scan-secrets.result }}   |"
+          } >> "$GITHUB_STEP_SUMMARY"
